@@ -247,3 +247,162 @@ def test_view_does_not_retain_large_noop_request(cloud):
     # The view's own arrays carry no voxel slots when nothing changed.
     assert child.values.nbytes == 0
     assert child.winner_pidx.nbytes == 0
+
+
+# --------------------------------------------------------------------------- #
+# Sparse backward: allocation and resolution are proportional to the request
+# --------------------------------------------------------------------------- #
+def _big_store(store, n=5000, c=4):
+    ids = list(range(n))
+    coords = [[0, 0, 0]] * n
+    feats = np.random.RandomState(0).randn(n, c).tolist()
+    return store.create_frame(ids, coords, feats)
+
+
+def test_sparse_backward_never_allocates_full_dense(store, monkeypatch):
+    import app.core as core
+
+    frame, root = _big_store(store)
+    seen: list[tuple] = []
+    real_zeros = np.zeros
+
+    def spy(shape, *args, **kwargs):
+        if isinstance(shape, tuple):
+            seen.append(tuple(int(x) for x in shape))
+        return real_zeros(shape, *args, **kwargs)
+
+    monkeypatch.setattr(core.np, "zeros", spy)
+    res = store.backward(root, {0: np.ones(frame.channels)}, include_dense=False)
+    monkeypatch.undo()
+
+    assert "dense_gradients" not in res
+    # No (N, C) allocation anywhere in the routing path.
+    assert (frame.num_points, frame.channels) not in seen
+    assert res["receiving_point_count"] <= frame.channels
+    for entry in res["point_gradients"]:
+        assert len(entry["grad"]) == frame.channels
+
+
+def test_sparse_and_dense_backward_agree(cloud):
+    store, frame, root = cloud
+    grads = {
+        0: np.asarray([1.0, 2.0]),
+        1: np.asarray([3.0, 4.0]),
+    }
+    sparse = store.backward(root, grads, include_dense=False)
+    dense = store.backward(root, grads, include_dense=True)
+    assert "dense_gradients" not in sparse
+    assert sparse["gradients_by_point"] == dense["gradients_by_point"]
+    assert sparse["sparse_gradients"] == dense["sparse_gradients"]
+    # Sparse per-point vectors are exactly the rows of the dense matrix.
+    for entry in sparse["point_gradients"]:
+        assert entry["grad"] == dense["dense_gradients"][entry["point_index"]]
+
+
+def test_sparse_backward_routes_only_referenced_voxels(cloud, monkeypatch):
+    store, frame, root = cloud
+    calls: list[int] = []
+    orig = type(root).get_voxel_state
+
+    def spy(self, vidx):
+        calls.append(vidx)
+        return orig(self, vidx)
+
+    monkeypatch.setattr(type(root), "get_voxel_state", spy)
+    store.backward(root, {1: np.asarray([5.0, 6.0])}, include_dense=False)
+    assert calls == [1]  # voxel 0 was never resolved
+
+
+def test_compact_matrix_resolves_no_full_frame_state(store, monkeypatch):
+    import app.parsing as parsing
+
+    # 40 singleton voxels; the view keeps only the last 3 non-empty.
+    n = 40
+    ids = list(range(n))
+    coords = [[i, 0, 0] for i in range(n)]
+    feats = [[float(i), float(n - i)] for i in range(n)]
+    frame, root = store.create_frame(ids, coords, feats)
+    old = store.apply_edit(root, mask_raw=list(range(n - 3)))
+
+    calls = {"states": 0, "voxel": 0}
+    orig_states = type(old).resolved_voxel_states
+    orig_voxel = type(old).get_voxel_state
+
+    def spy_states(self):
+        calls["states"] += 1
+        return orig_states(self)
+
+    def spy_voxel(self, vidx):
+        calls["voxel"] += 1
+        return orig_voxel(self, vidx)
+
+    monkeypatch.setattr(type(old), "resolved_voxel_states", spy_states)
+    monkeypatch.setattr(type(old), "get_voxel_state", spy_voxel)
+
+    applied, meta = parsing.parse_backward_payload(
+        {"grad_values": [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]}, old
+    )
+    assert sorted(applied) == [n - 3, n - 2, n - 1]
+    assert meta["applied_voxels"] == 3
+    # Compact positional matrices align to this view's non-empty voxel order
+    # without expanding the full-frame voxel state.
+    assert calls["states"] == 0
+    assert calls["voxel"] == 0
+
+
+def test_frame_matrix_skips_empty_voxels_without_full_expansion(store, monkeypatch):
+    import app.parsing as parsing
+
+    n = 30
+    ids = list(range(n))
+    coords = [[i, 0, 0] for i in range(n)]
+    feats = [[float(i), float(n - i)] for i in range(n)]
+    frame, root = store.create_frame(ids, coords, feats)
+    old = store.apply_edit(root, mask_raw=list(range(n - 2)))
+
+    calls = {"states": 0}
+    orig_states = type(old).resolved_voxel_states
+
+    def spy_states(self):
+        calls["states"] += 1
+        return orig_states(self)
+
+    monkeypatch.setattr(type(old), "resolved_voxel_states", spy_states)
+
+    rows = np.zeros((frame.num_voxels, 2))
+    rows[n - 2:] = 1.0
+    applied, meta = parsing.parse_backward_payload({"grad_values": rows.tolist()}, old)
+    # Original frame order: only the last two indices receive gradients.
+    assert sorted(applied) == [n - 2, n - 1]
+    assert meta["ignored_empty_voxels"] == [[i, 0, 0] for i in range(n - 2)]
+    assert calls["states"] == 0
+
+
+def test_explicit_index_and_coord_only_resolve_referenced_voxels(store, monkeypatch):
+    import app.parsing as parsing
+
+    n = 30
+    ids = list(range(n))
+    coords = [[i, 0, 0] for i in range(n)]
+    feats = [[float(i), float(n - i)] for i in range(n)]
+    frame, root = store.create_frame(ids, coords, feats)
+    old = store.apply_edit(root, mask_raw=list(range(n - 2)))
+
+    calls: list[int] = []
+    orig = type(old).get_voxel_state
+
+    def spy(self, vidx):
+        calls.append(vidx)
+        return orig(self, vidx)
+
+    monkeypatch.setattr(type(old), "get_voxel_state", spy)
+
+    parsing.parse_backward_payload(
+        {"grad_output": [{"voxel_index": n - 1, "grad": [1.0, 2.0]}]}, old
+    )
+    assert calls == [n - 1]
+    calls.clear()
+    parsing.parse_backward_payload(
+        {"grad_output": [{"voxel_coord": [n - 2, 0, 0], "grad": [1.0, 2.0]}]}, old
+    )
+    assert calls == [n - 2]

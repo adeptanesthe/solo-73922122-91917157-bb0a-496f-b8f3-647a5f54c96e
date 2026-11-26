@@ -177,6 +177,38 @@ def run_walkthrough(store: Store | None = None) -> dict[str, Any]:
         },
     })
 
+    # 6b. Same old view, sparse vs dense backward ---------------------------
+    #     Sparse omits the N*C matrix entirely; routing is identical.
+    bw_sparse = st.backward(masked, grads, include_dense=False)
+    check("sparse backward omits the dense matrix",
+          "dense_gradients" not in bw_sparse,
+          "absent", sorted(k for k in bw_sparse if k.startswith("dense")))
+    check("sparse backward routes exactly as dense",
+          bw_sparse["gradients_by_point"] == bw_old["gradients_by_point"]
+          and bw_sparse["sparse_gradients"] == bw_old["sparse_gradients"],
+          bw_old["gradients_by_point"], bw_sparse["gradients_by_point"])
+    check("sparse backward allocates only receiving points",
+          len(bw_sparse["point_gradients"]) == bw_sparse["receiving_point_count"],
+          bw_sparse["receiving_point_count"],
+          len(bw_sparse["point_gradients"]))
+    steps.append({
+        "step": 7,
+        "action": "backward_sparse_vs_dense_on_same_old_view",
+        "view_id": masked.view_id,
+        "upstream": [
+            {"voxel_index": 0, "grad": [1.0, 2.0]},
+            {"voxel_index": 1, "grad": [3.0, 4.0]},
+        ],
+        "sparse": {
+            "point_gradients": bw_sparse["point_gradients"],
+            "sparse_gradients": bw_sparse["sparse_gradients"],
+            "dense_gradients_present": "dense_gradients" in bw_sparse,
+        },
+        "dense": {
+            "dense_gradients": bw_old["dense_gradients"],
+        },
+    })
+
     # 7. Unknown id rejects the whole edit without creating a view ----------
     views_before = len(st.views)
     rejected_body: dict[str, Any] = {}
@@ -191,7 +223,7 @@ def run_walkthrough(store: Store | None = None) -> dict[str, Any]:
     check("rejected edit creates no view",
           views_before == views_after, views_before, views_after)
     steps.append({
-        "step": 7,
+        "step": 8,
         "action": "edit_with_unknown_ids",
         "request": {"point_ids": [1, 999, 1000]},
         "rejection": rejected_body,

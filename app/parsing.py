@@ -314,9 +314,8 @@ def parse_coord_key(raw: Any, dim: int) -> Optional[tuple[int, ...]]:
 
 
 def nonempty_voxel_indices(view: View) -> list[int]:
-    states = view.resolved_voxel_states()
-    out = [vidx for vidx in sorted(states.keys()) if states[vidx][1][0] >= 0]
-    return out
+    """Ascending non-empty voxel indices without materializing full state."""
+    return view.nonempty_voxel_indices()
 
 
 def parse_backward_payload(
@@ -460,15 +459,26 @@ def parse_backward_payload(
 
     if positional_matrix is not None:
         rows = positional_matrix
-        ne = nonempty_voxel_indices(view)
-        if len(rows) == len(ne):
+        # One compact scan of the delta chain decides both the count and, only
+        # if needed, the alignment order.  Full-frame voxel state is never
+        # expanded regardless of which layout the caller chose.
+        empty = view.empty_voxel_indices()
+        nonempty_count = frame.num_voxels - len(empty)
+        if len(rows) == nonempty_count:
+            # Compact layout: aligned to this view's non-empty voxel order.
+            if empty:
+                occupied = np.ones(frame.num_voxels, dtype=bool)
+                occupied[np.fromiter(empty, dtype=np.int64, count=len(empty))] = False
+                ne = np.flatnonzero(occupied).tolist()
+            else:
+                ne = list(range(frame.num_voxels))
             for vidx, vec in zip(ne, rows):
                 applied[vidx] = _as_grad_vector(vec, c, f"gradient for voxel {frame.voxel_coord(vidx)}")
         elif len(rows) == frame.num_voxels:
-            # Dense layout over the frame's original voxel order; empty ones ignored.
+            # Dense layout over the frame's original voxel order; empty ones
+            # ignored.
             for vidx, vec in enumerate(rows):
-                w = view.get_voxel_state(vidx)[1]
-                if w[0] < 0:
+                if vidx in empty:
                     ignored_empty.append(frame.voxel_coord(vidx))
                     continue
                 applied[vidx] = _as_grad_vector(vec, c, f"gradient for voxel {vidx}")
@@ -476,9 +486,13 @@ def parse_backward_payload(
             raise APIError(
                 422,
                 "GRAD_ROW_COUNT_MISMATCH",
-                f"got {len(rows)} gradient rows; expected {len(ne)} non-empty voxels "
+                f"got {len(rows)} gradient rows; expected "
+                f"{nonempty_count} non-empty voxels "
                 f"or {frame.num_voxels} frame voxels",
-                {"nonempty_voxels": len(ne), "frame_voxels": frame.num_voxels},
+                {
+                    "nonempty_voxels": nonempty_count,
+                    "frame_voxels": frame.num_voxels,
+                },
             )
 
     # ---- resolve explicit references ------------------------------------- #

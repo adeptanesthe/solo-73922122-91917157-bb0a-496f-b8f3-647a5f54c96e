@@ -41,6 +41,10 @@ app = FastAPI(
         "recomputed; the new view stores just that delta.\n"
         "* Backward submits upstream voxel gradients for a view and returns "
         "sparse point gradients routed to the point ids that won at that time.\n"
+        "* Sparse backward stays sparse: only the referenced voxels are "
+        "resolved and only receiving points get a gradient vector. The full "
+        "point-aligned `dense_gradients` matrix is only built when dense is "
+        "requested or the cloud is small (opt out with `?dense=false`).\n"
         "* Edits mentioning unknown point ids reject the entire request.\n\n"
         "Start with `POST /demo/walkthrough` or expand the examples below."
     ),
@@ -162,6 +166,34 @@ BACKWARD_EXAMPLES = {
         "value": {
             "voxel_coords": [[0, 0, 0], [1, 0, 0]],
             "grad_values": [[1.0, 2.0], [3.0, 4.0]],
+        },
+    },
+    "sparse_only": {
+        "summary": "Sparse response, no dense matrix",
+        "description": (
+            "Only the two referenced voxels are resolved; point gradients are "
+            "returned per receiving point and no N*C dense matrix is built."
+        ),
+        "value": {
+            "dense": False,
+            "grad_output": [
+                {"voxel_coord": [0, 0, 0], "grad": [1.0, 2.0]},
+                {"voxel_coord": [1, 0, 0], "grad": [3.0, 4.0]},
+            ],
+        },
+    },
+    "dense_matrix": {
+        "summary": "Force the full point-aligned dense matrix",
+        "description": (
+            "Same request with dense=true: identical sparse routing plus the "
+            "full N*C dense_gradients matrix."
+        ),
+        "value": {
+            "dense": True,
+            "grad_output": [
+                {"voxel_coord": [0, 0, 0], "grad": [1.0, 2.0]},
+                {"voxel_coord": [1, 0, 0], "grad": [3.0, 4.0]},
+            ],
         },
     },
 }
@@ -453,8 +485,17 @@ def _wants_dense(payload: Any, query_value: bool | None) -> bool | None:
 def _backward_for_view(view, payload: Any, dense_query: bool | None = None) -> dict[str, Any]:
     if payload is None:
         payload = {}
+
+    cells = view.frame.num_points * view.frame.channels
+    wants_dense = _wants_dense(payload, dense_query)
+    # Decide *before* routing so a sparse request never allocates the full
+    # N*C matrix in the engine in the first place.
+    include_dense = wants_dense is True or (
+        wants_dense is None and cells <= DENSE_CELL_LIMIT
+    )
+
     grad_by_vidx, meta = parse_backward_payload(payload, view)
-    result = store.backward(view, grad_by_vidx)
+    result = store.backward(view, grad_by_vidx, include_dense=include_dense)
     result.update(
         {
             "view_id": view.view_id,
@@ -464,12 +505,7 @@ def _backward_for_view(view, payload: Any, dense_query: bool | None = None) -> d
         }
     )
 
-    cells = view.frame.num_points * view.frame.channels
-    wants_dense = _wants_dense(payload, dense_query)
-    if wants_dense is True:
-        pass  # keep dense_gradients produced by the core
-    elif wants_dense is False or cells > DENSE_CELL_LIMIT:
-        result.pop("dense_gradients", None)
+    if not include_dense:
         result["dense_gradients_available"] = True
         result["dense_cell_count"] = cells
         if wants_dense is not False:

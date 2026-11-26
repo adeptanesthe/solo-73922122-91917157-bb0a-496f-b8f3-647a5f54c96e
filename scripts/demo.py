@@ -148,6 +148,25 @@ def main() -> int:
           bw0["gradients_by_point"].get("1") == [10.0, 0.0],
           [10.0, 0.0], bw0["gradients_by_point"].get("1"))
 
+    # 4c. Same OLD view: sparse (no dense matrix) vs dense -----------------
+    print("\n[4c] Same OLD view: sparse vs dense backward")
+    _, bw_sparse = call(
+        "POST", f"/views/{v_masked}/backward",
+        {**bw_body, "dense": False},
+    )
+    check("sparse responses omit dense_gradients",
+          "dense_gradients" not in bw_sparse,
+          "absent", sorted(k for k in bw_sparse if k.startswith("dense")))
+    check("sparse routing equals dense routing",
+          bw_sparse["gradients_by_point"] == bw["gradients_by_point"]
+          and bw_sparse["sparse_gradients"] == bw["sparse_gradients"])
+    check("sparse allocates only receiving points",
+          len(bw_sparse["point_gradients"]) == bw_sparse["receiving_point_count"],
+          bw_sparse["receiving_point_count"],
+          len(bw_sparse["point_gradients"]))
+    print("   sparse point gradients =", json.dumps(bw_sparse["point_gradients"]))
+    print("   dense (only on request) =", json.dumps(bw["dense_gradients"]))
+
     # 5. Unknown ids -> whole edit rejected --------------------------------
     print("\n[5] Edit with unknown point id 999 -> whole request rejected")
     status, err = call(

@@ -476,7 +476,13 @@ class View:
     def resolved_voxel_states(
         self,
     ) -> dict[int, tuple[np.ndarray, np.ndarray, int]]:
-        """Nearest-ancestor resolution for every voxel (used for full output)."""
+        """Nearest-ancestor resolution for every voxel (used for full output).
+
+        Materializes the complete state of the whole lineage (all ``D*C``
+        slots).  Backward parsing deliberately does **not** use this; it uses
+        :meth:`nonempty_voxel_indices` / :meth:`get_voxel_state` instead so a
+        sparse request never expands the full-frame state.
+        """
         states: dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
         cur: Optional[View] = self
         while cur is not None:
@@ -490,6 +496,47 @@ class View:
                     )
             cur = cur.parent
         return states
+
+    def empty_voxel_indices(self) -> set[int]:
+        """Frame-voxel indices that are empty in this view.
+
+        Only non-root dirty arrays are inspected (the root view is all-visible,
+        so it has no empty voxels) and every voxel is decided by its nearest
+        delta entry.  This never materializes full-frame ``values`` /
+        ``winner_pidx`` state.
+        """
+        empty: set[int] = set()
+        seen: set[int] = set()
+        cur: Optional[View] = self
+        while cur is not None and cur.parent is not None:
+            for pos, vidx_raw in enumerate(cur.dirty_vidx):
+                vidx = int(vidx_raw)
+                if vidx in seen:  # nearest ancestor already decided it
+                    continue
+                seen.add(vidx)
+                if cur.winner_pidx[pos, 0] < 0:
+                    empty.add(vidx)
+            cur = cur.parent
+        return empty
+
+    def nonempty_voxel_count(self) -> int:
+        return self.frame.num_voxels - len(self.empty_voxel_indices())
+
+    def nonempty_voxel_indices(self) -> list[int]:
+        """Ascending frame-voxel indices that are non-empty in this view.
+
+        Used to align positional gradient matrices.  This resolves only the
+        *first-channel winner* of voxels touched by the lineage's delta
+        arrays; it never materializes ``values`` / full ``winner_pidx`` state
+        for the whole frame.
+        """
+        total = self.frame.num_voxels
+        empty = self.empty_voxel_indices()
+        if not empty:
+            return list(range(total))
+        occupied = np.ones(total, dtype=bool)
+        occupied[np.fromiter(empty, dtype=np.int64, count=len(empty))] = False
+        return np.flatnonzero(occupied).tolist()
 
     # -- small stats -------------------------------------------------------- #
     @property
@@ -808,11 +855,17 @@ class Store:
         self,
         view: View,
         grad_by_vidx: dict[int, np.ndarray],
+        include_dense: bool = True,
     ) -> dict[str, Any]:
-        """Route upstream voxel gradients to the winning point per channel."""
+        """Route upstream voxel gradients to the winning point per channel.
+
+        Only voxels actually present in ``grad_by_vidx`` have their winners
+        resolved, and only points that receive at least one channel route get
+        a gradient vector allocated.  The full ``[N, C]`` dense matrix is
+        built **only** when ``include_dense`` is true.
+        """
         frame = view.frame
         n, c = frame.num_points, frame.channels
-        dense = np.zeros((n, c), dtype=np.float64)
 
         routed_pidx: list[int] = []
         routed_chan: list[int] = []
@@ -832,7 +885,6 @@ class Store:
                 np.asarray(vidxs, dtype=np.int64)[:, None], (k, c)
             )[mask]
             g_sel = grads[mask]
-            np.add.at(dense, (p_sel, c_sel), g_sel)
 
             routed_pidx = [int(x) for x in p_sel]
             routed_chan = [int(x) for x in c_sel]
@@ -841,15 +893,25 @@ class Store:
         else:
             routed_vidx = []
 
+        # Accumulate only the points that received at least one channel route;
+        # each such point gets one length-C vector, not the whole point cloud.
+        grad_by_pidx: dict[int, np.ndarray] = {}
+        for pidx, ch, val in zip(routed_pidx, routed_chan, routed_val):
+            vec = grad_by_pidx.get(pidx)
+            if vec is None:
+                vec = np.zeros(c, dtype=np.float64)
+                grad_by_pidx[pidx] = vec
+            vec[ch] += val
+
         # Unique set of points that received at least one channel route.
-        receiving = sorted(set(routed_pidx), key=lambda p: frame.point_ids[p])
+        receiving = sorted(grad_by_pidx.keys(), key=lambda p: frame.point_ids[p])
 
         point_gradients: list[dict[str, Any]] = []
         gradients_by_point: dict[str, list[float]] = {}
         grad_point_ids: list[Any] = []
         grad_values: list[list[float]] = []
         for pidx in receiving:
-            vec = [float(x) for x in dense[pidx]]
+            vec = [float(x) for x in grad_by_pidx[pidx]]
             cid = frame.point_ids[pidx]
             key = str(cid)
             gradients_by_point[key] = vec
@@ -881,8 +943,7 @@ class Store:
         # Sort sparse entries deterministically by (point id order, channel).
         sparse_entries.sort(key=lambda e: (e["point_index"], e["channel"]))
 
-        return {
-            "dense_gradients": dense.tolist(),
+        result: dict[str, Any] = {
             "point_ids": list(frame.point_ids),
             "point_gradients": point_gradients,
             "gradients_by_point": gradients_by_point,
@@ -899,6 +960,15 @@ class Store:
             "routed_channels": len(routed_pidx),
             "receiving_point_count": len(receiving),
         }
+
+        if include_dense:
+            # Allocate the full point-aligned matrix only when asked for it.
+            dense = np.zeros((n, c), dtype=np.float64)
+            for pidx, vec in grad_by_pidx.items():
+                dense[pidx] = vec
+            result["dense_gradients"] = dense.tolist()
+
+        return result
 
 
 # A process-wide default store used by the HTTP application.

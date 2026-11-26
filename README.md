@@ -17,7 +17,9 @@ time**, with deterministic smallest-id tie-breaking.
 | Ties → smallest point id per channel | Members of each voxel are stored ascending by point id; first-`argmax` therefore selects the smallest id on exact ties. Verified by randomized brute-force tests. |
 | Recompute only voxels of actually-changed points | Actual flips are computed against the base view; `dirty_vidx = unique(voxel(p) for p in changed)`. Already-hidden masks / already-visible restores are no-ops and recompute nothing. |
 | New-view resident state grows only with changed points + those voxels' channels | A view stores only `vis_delta` (`K`), `changed_pidx` (`K`), and `values`/`winner_pidx` arrays of shape `(D, C)` plus a `(D,)` index. It does **not** retain request id lists. Exposed as `delta` / `resident_delta` in every view response. |
-| Backward by view id + upstream gradients of non-empty voxels → sparse point gradients by then-winners | `POST /views/{view_id}/backward` and `POST /backward`. Winners are resolved from that immutable view's delta chain, so old views keep their old routing. Returns `sparse_gradients`, COO `sparse`, `point_gradients`, `gradients_by_point`, and a point-aligned `dense_gradients` for small clouds (auto-sparse at >65 536 cells; `?dense=true` to force). |
+| Backward by view id + upstream gradients of non-empty voxels → sparse point gradients by then-winners | `POST /views/{view_id}/backward` and `POST /backward`. Winners are resolved from that immutable view's delta chain, so old views keep their old routing. Returns `sparse_gradients`, COO `sparse`, `point_gradients`, `gradients_by_point`, and — only when requested or the cloud is small — a point-aligned `dense_gradients`. |
+| Sparse backward stays sparse | The dense `N×C` matrix is built **only** when `?dense=true` / `"dense": true`, or by default when `N*C ≤ 65 536`; with `?dense=false` (or above the threshold) no `N×C` allocation happens at all. Routing allocates one length-`C` vector per **receiving** point only, and resolves winners only for voxels referenced in the request. |
+| Compact positional matrices align to the view, not the frame | A positional matrix with `nonempty_voxel_count` rows maps to the view's non-empty voxels in ascending `voxel_index` order (the same order as the forward response). Aligning or filtering never expands full-frame voxel state: membership comes from a compact first-winner scan of the delta chain. A matrix with `frame.voxel_count` rows keeps the **original frame voxel order** and skips empty voxels. |
 | Unknown point id in an edit → reject whole request | All ids are resolved first; any unknown id yields `400 UNKNOWN_POINT_IDS` with the full list, no view allocated/registered, no state change. |
 | Start with Docker Compose; demonstrate mask / restore / old-view backward from `/docs` | `docker compose up --build` → <http://localhost:8000/docs>. Every endpoint ships prefilled examples; `POST /demo/walkthrough` runs and self-checks the whole story in one call; `scripts/demo.py` drives it over HTTP. |
 
@@ -98,19 +100,32 @@ each endpoint and press **Execute**.
    Even though the newer branch changed voxel 0 to winners `[3,3]`, the old
    masked view still routes both channels of voxel 0 to point `2`:
    `dense_gradients == [[0,0],[1,2],[0,0],[0,4],[3,0]]` (point order 1…5).
+6. **Sparse vs dense on the same old view:** call the same
+   `POST /views/{masked_view_id}/backward` twice:
+   * choose the `sparse_only` example (`"dense": false`) → response has
+     `point_gradients` / `sparse_gradients` / `gradients_by_point` but **no**
+     `dense_gradients` key, plus `dense_gradients_available: true`;
+   * choose the `dense_matrix` example (`"dense": true`) → identical routing
+     **plus** the full `dense_gradients` matrix.
+   Both use the old view's winners; only the dense version allocates `N×C`.
 
 ### Backward payload formats accepted
 
 * `{"grad_output":[{"voxel_coord":[0,0,0],"grad":[…]}, …]}`
 * same with `"voxel_index"` / `"voxel_id"`
 * columnar `{"voxel_coords":[…], "grad_values":[…]}`
-* positional `{"grad_values":[[…], …]}` aligned to the response's non-empty
-  voxel order (or all `frame.num_voxels` frame voxels, empty ones skipped)
+* positional `{"grad_values":[[…], …]}`:
+  * `nonempty_voxel_count` rows → aligned to **this view's** non-empty voxels
+    in ascending `voxel_index` order (never expands full-frame state);
+  * `frame.voxel_count` rows → **original frame voxel order**, empty voxels
+    skipped and reported under `parse`;
+  * `D*C`-proportional work only covers the referenced rows.
 * body-level `POST /backward` with `"view_id"`
 * mapping `{"gradients_by_voxel": {"0,0,0": […]}}`
 
-Unknown / currently-empty voxel references are ignored by default and listed
-under `parse`; pass `"strict": true` to reject them with 4xx.
+Only voxels referenced by the request have their winners resolved; unknown /
+currently-empty voxel references are ignored by default and listed under
+`parse`; pass `"strict": true` to reject them with 4xx.
 
 ## API surface
 
@@ -137,7 +152,7 @@ app/responses.py # JSON serialization
 app/demo.py      # deterministic self-checking walkthrough
 app/main.py      # FastAPI routes + OpenAPI examples
 scripts/demo.py  # stdlib-only HTTP demo for docker compose
-tests/           # 37 engine + HTTP tests
+tests/           # 43 engine + HTTP tests
 Dockerfile docker-compose.yml requirements*.txt
 ```
 
@@ -147,18 +162,22 @@ Executed in the delivery environment with Python 3.11 and the pinned
 dependencies installed into an isolated prefix (no Docker daemon/CLI exists in
 this build sandbox, so the image itself was not built here):
 
-* `pytest -q` → **37 passed**.
-* Live `uvicorn` server (started with only `requirements.txt` on
-  `PYTHONPATH`, i.e. the image's runtime dependency set):
-  `python scripts/demo.py` → **11/11 checks passed**.
-* Replayed **all 17 request examples embedded in `/docs`** over real HTTP →
-  all `200`.
-* Randomized differential test vs. a brute-force Python implementation
-  (300 points, 63 voxels, 5 channels): all channel maxima/tie winners and a
-  15-op chained-view backward matched exactly.
-* Scale sanity: 100 000 points / ~1 000 voxels / 16 channels upload+root pool
-  ≈ 1.7 s; chained single-point edits ≈ 1 ms/edit; 20 concurrent branching
-  edits produced unique view ids.
+* `pytest -q` → **43 passed** (6 new regression tests: no full dense allocation,
+  sparse/dense equivalence, only-referenced-voxel resolution, compact/frame
+  positional alignment without full-frame state expansion).
+* Live `uvicorn` server on the runtime dependency set: `python scripts/demo.py`
+  → **14/14 checks passed**, including the new sparse-vs-dense section on the
+  same old view.
+* Replayed **all 19 request examples embedded in `/docs`** over real HTTP
+  (including the new `sparse_only` and `dense_matrix` examples) → all `200`.
+* Randomized differential test of the compact non-empty resolution vs. a full
+  state scan over 40 chained/branched views → identical ordering and alignment.
+* Scale sanity (100 000 points / 1 000 voxels / 16 channels, old view with only
+  5 non-empty voxels): sparse `?dense=false` backward **0.05 s / 580 KB**
+  payload vs. `?dense=true` **1.93 s / 7.0 MB**; values identical. In-process
+  `Store.backward(..., include_dense=False)` took **0.002 s, 0.8 MB peak**
+  (before the fix: 6.5 s and a 71 MB dense matrix for the same single-voxel
+  request).
 * `docker-compose.yml` parses as valid YAML; the image `HEALTHCHECK` one-liner
   was executed successfully against a live server;
   `pip install -r requirements.txt` into a clean target succeeded.
@@ -175,7 +194,9 @@ this build sandbox, so the image itself was not built here):
 * Delta-chain resolution cost grows with lineage depth for full-output
   assembly; very long chains could be accelerated with periodic snapshots
   (not needed for correctness, and per-edit recompute itself stays O(dirty)).
-* The full dense `N×C` backward matrix is omitted by default for large clouds;
-  force it with `?dense=true` if your client wants point-aligned dense grads.
+* The full dense `N×C` backward matrix is omitted by default when `N*C`
+  exceeds 65 536 cells; sparse responses remain complete. Force it with
+  `?dense=true` if your client wants point-aligned dense grads, or disable it
+  everywhere with `?dense=false`.
 * Coordinates are integer lists (any dimension ≥ 1); dict-style `{x,y,z}`
   coordinates are not parsed.
